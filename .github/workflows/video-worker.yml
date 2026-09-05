@@ -1,0 +1,759 @@
+name: Process Video Chunks
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ids:
+        description: "Comma-separated User IDs (format: ID:TOPIC,ID:TOPIC)"
+        required: true
+        type: string
+
+      server_url:
+        description: "File server URL"
+        required: true
+        type: string
+
+      auth_token:
+        description: "File server auth token"
+        required: true
+        type: string
+
+      job_id:
+        description: "Orchestrator Job ID"
+        required: true
+        type: string
+
+      worker_id:
+        description: "Worker ID 01-15"
+        required: true
+        type: string
+
+      total_jobs:
+        description: "Total jobs"
+        required: true
+        type: string
+
+      hashtag:
+        description: "Hashtag for caption"
+        required: false
+        default: ""
+        type: string
+
+      video_list:
+        description: "Comma-separated specific video files"
+        required: false
+        default: ""
+        type: string
+
+
+# Only one active run per Worker repository.
+concurrency:
+  group: video-worker
+  cancel-in-progress: false
+
+
+jobs:
+  process-chunk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+
+      # ======================================================
+      # Checkout
+      # ======================================================
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+
+      # ======================================================
+      # System dependencies
+      # ======================================================
+
+      - name: Install System Dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            ffmpeg \
+            jq \
+            curl \
+            wget \
+            aria2
+
+
+      # ======================================================
+      # Python dependencies
+      # ======================================================
+
+      - name: Install Python Dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          pip3 install \
+            opencv-python \
+            invisible-watermark \
+            --break-system-packages
+
+
+      # ======================================================
+      # Download and install tdl
+      # ======================================================
+
+      - name: Download and Verify tdl
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "📦 Downloading tdl..."
+
+          TDL_TMP="/tmp/tdl-install"
+
+          rm -rf "$TDL_TMP"
+          mkdir -p "$TDL_TMP"
+
+          curl -fsSL \
+            "https://github.com/iyear/tdl/releases/latest/download/tdl_Linux_64bit.tar.gz" \
+            -o "$TDL_TMP/tdl.tar.gz"
+
+          tar xzf \
+            "$TDL_TMP/tdl.tar.gz" \
+            -C "$TDL_TMP"
+
+          TDL_BIN=""
+
+          if [[ -x "$TDL_TMP/tdl" ]]; then
+            TDL_BIN="$TDL_TMP/tdl"
+          else
+            TDL_BIN="$(
+              find "$TDL_TMP" \
+                -type f \
+                -name "tdl" \
+                -perm -u+x \
+                -print \
+                -quit
+            )"
+          fi
+
+          if [[ -z "$TDL_BIN" || ! -f "$TDL_BIN" ]]; then
+            echo "❌ tdl binary not found after extraction"
+            echo "📂 Extracted files:"
+            find "$TDL_TMP" -maxdepth 3 -type f -print
+            exit 1
+          fi
+
+          sudo install \
+            -m 0755 \
+            "$TDL_BIN" \
+            /usr/local/bin/tdl
+
+          rm -rf "$TDL_TMP"
+
+          echo "✅ tdl installed"
+
+          tdl version
+
+
+      # ======================================================
+      # Restore Worker-specific Telegram session
+      # ======================================================
+
+      - name: Restore Telegram Session
+        shell: bash
+        env:
+          TDL_SESSIONS_B64: ${{ secrets.TDL_SESSIONS_B64 }}
+          WORKER_ID: ${{ inputs.worker_id }}
+
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$TDL_SESSIONS_B64" ]]; then
+            echo "❌ TDL_SESSIONS_B64 is missing"
+            exit 1
+          fi
+
+          if [[ -z "$WORKER_ID" ]]; then
+            echo "❌ worker_id is missing"
+            exit 1
+          fi
+
+          # Convert:
+          # 01 -> 1
+          # 02 -> 2
+          # ...
+          # 15 -> 15
+
+          WORKER_NUM=$((10#$WORKER_ID))
+
+          NS="session_job_${WORKER_NUM}"
+          STORAGE_PATH="/tmp/tdl-data/data"
+          SESSION_FILE="$STORAGE_PATH/$NS"
+
+          echo "=========================================="
+          echo "Worker ID     : $WORKER_ID"
+          echo "Worker number : $WORKER_NUM"
+          echo "TDL namespace : $NS"
+          echo "Storage path  : $STORAGE_PATH"
+          echo "=========================================="
+
+          rm -rf /tmp/tdl-data
+          mkdir -p /tmp/tdl-data
+
+          printf '%s' "$TDL_SESSIONS_B64" \
+            | base64 -d \
+            | tar xzf - \
+                -C /tmp/tdl-data
+
+          echo
+          echo "📂 Restored files:"
+
+          find /tmp/tdl-data \
+            -maxdepth 3 \
+            -type f \
+            -printf '%p (%s bytes)\n'
+
+          if [[ ! -f "$SESSION_FILE" ]]; then
+            echo "❌ Session file not found:"
+            echo "   $SESSION_FILE"
+            exit 1
+          fi
+
+          echo
+          echo "✅ Session file found:"
+          echo "   $SESSION_FILE"
+
+          echo
+          echo "📦 Installing tdl-whoami..."
+
+          # tdl-whoami is optional.
+          # GitHub API rate limits can cause installation to fail.
+          if tdl extension install --force iyear/tdl-whoami; then
+            echo "✅ tdl-whoami installed"
+          else
+            echo "⚠️ tdl-whoami installation failed"
+            echo "⚠️ Continuing without whoami verification..."
+          fi
+
+          echo
+          echo "🔎 Verifying Telegram session..."
+
+          if command -v tdl >/dev/null 2>&1 && \
+             tdl whoami \
+               --storage "type=bolt,path=$STORAGE_PATH" \
+               --ns "$NS" \
+               >/tmp/tdl-whoami-output 2>&1; then
+
+            cat /tmp/tdl-whoami-output
+
+            if grep -qE "ID: [0-9]+" /tmp/tdl-whoami-output; then
+              echo "✅ Telegram session is valid: $NS"
+            else
+              echo "⚠️ whoami returned output but ID was not detected"
+              echo "⚠️ Continuing..."
+            fi
+
+          else
+            echo "⚠️ tdl whoami failed or is unavailable"
+            echo "⚠️ This check is OPTIONAL"
+            echo "⚠️ Continuing with restored session..."
+          fi
+
+
+      # ======================================================
+      # Cache videos
+      # ======================================================
+
+      - name: Cache videos
+        uses: actions/cache@v4
+        with:
+          path: ./videos
+          key: videos-cache-v1
+          restore-keys: |
+            videos-cache-
+
+
+      # ======================================================
+      # Cleanup stale cached files
+      # ======================================================
+
+      - name: Cleanup stale cached files
+        shell: bash
+        env:
+          VIDEO_LIST: ${{ inputs.video_list }}
+
+        run: |
+          set -euo pipefail
+
+          mkdir -p ./videos
+
+          if [[ -n "$VIDEO_LIST" ]]; then
+
+            echo "🧹 Cleaning stale cached files..."
+
+            IFS=',' read -ra KEEP_FILES <<< "$VIDEO_LIST"
+
+            declare -A KEEP_SET
+
+            for f in "${KEEP_FILES[@]}"; do
+
+              f="$(echo "$f" | xargs)"
+
+              if [[ -n "$f" ]]; then
+                KEEP_SET["$f"]=1
+              fi
+
+            done
+
+            while IFS= read -r -d '' file; do
+
+              basename="$(basename "$file")"
+
+              if [[ -z "${KEEP_SET[$basename]:-}" ]]; then
+
+                echo "🗑️ Removing stale file: $basename"
+
+                rm -f "$file"
+
+              fi
+
+            done < <(
+              find ./videos \
+                -type f \
+                -name '*.mp4' \
+                -print0
+            )
+
+          else
+
+            echo "📦 No specific video list."
+
+          fi
+
+          echo
+          echo "📋 Remaining files:"
+
+          ls -lh ./videos/ 2>/dev/null || true
+
+
+      # ======================================================
+      # Download videos from server
+      # ======================================================
+
+      - name: Download videos from server
+        shell: bash
+        env:
+          SERVER_URL: ${{ inputs.server_url }}
+          AUTH_TOKEN: ${{ inputs.auth_token }}
+          VIDEO_LIST: ${{ inputs.video_list }}
+
+        run: |
+          set -euo pipefail
+
+          mkdir -p ./videos
+
+          if [[ -n "$VIDEO_LIST" ]]; then
+
+            IFS=',' read -ra VIDEO_PATHS <<< "$VIDEO_LIST"
+
+            echo "🎯 Specific files:"
+            echo "   ${#VIDEO_PATHS[@]}"
+
+          else
+
+            echo "📋 Getting video list..."
+
+            VIDEOS="$(
+              curl -fsS \
+                "$SERVER_URL/list?token=$AUTH_TOKEN"
+            )"
+
+            if [[ -z "$VIDEOS" || "$VIDEOS" == "[]" ]]; then
+              echo "❌ No videos available"
+              exit 1
+            fi
+
+            mapfile -t VIDEO_PATHS < <(
+              echo "$VIDEOS" |
+                jq -r '.[].path'
+            )
+
+            echo "📦 Videos: ${#VIDEO_PATHS[@]}"
+
+          fi
+
+
+          for VPATH in "${VIDEO_PATHS[@]}"; do
+
+            VPATH="$(echo "$VPATH" | xargs)"
+
+            [[ -n "$VPATH" ]] || continue
+
+
+            # ------------------------------------------------
+            # Cache hit
+            # ------------------------------------------------
+
+            if [[ -f "./videos/$VPATH" ]]; then
+
+              FILE_SIZE="$(
+                stat -c%s "./videos/$VPATH" 2>/dev/null || echo 0
+              )"
+
+              if [[ "$FILE_SIZE" -gt 0 ]]; then
+
+                echo "⚡ Cache hit:"
+                echo "   $VPATH"
+                echo "   $(numfmt --to=iec "$FILE_SIZE")"
+
+                continue
+
+              fi
+
+            fi
+
+
+            mkdir -p "./videos/$(dirname "$VPATH")"
+
+            echo "📥 Downloading:"
+            echo "   $VPATH"
+
+
+            downloaded=0
+
+            for attempt in 1 2 3; do
+
+              aria2c \
+                --dir="./videos/$(dirname "$VPATH")" \
+                --out="$(basename "$VPATH")" \
+                --max-connection-per-server=16 \
+                --split=16 \
+                --min-split-size=1M \
+                --max-tries=3 \
+                --retry-wait=2 \
+                --timeout=60 \
+                --file-allocation=none \
+                --summary-interval=5 \
+                "$SERVER_URL/download?path=$VPATH&token=$AUTH_TOKEN"
+
+
+              if [[ -f "./videos/$VPATH" ]]; then
+
+                FILE_SIZE="$(
+                  stat -c%s "./videos/$VPATH" 2>/dev/null || echo 0
+                )"
+
+                if [[ "$FILE_SIZE" -gt 0 ]]; then
+
+                  echo "✅ Downloaded:"
+                  echo "   $VPATH"
+                  echo "   $(numfmt --to=iec "$FILE_SIZE")"
+
+                  downloaded=1
+                  break
+
+                fi
+
+              fi
+
+
+              echo "⚠️ Attempt $attempt failed"
+
+              rm -f "./videos/$VPATH"
+
+              sleep 3
+
+            done
+
+
+            if [[ "$downloaded" -ne 1 ]]; then
+
+              echo "❌ Download failed: $VPATH"
+
+              exit 1
+
+            fi
+
+          done
+
+          echo "✅ Download phase completed"
+
+
+      # ======================================================
+      # Debug upload endpoint
+      # ======================================================
+
+      - name: Debug upload endpoint
+        shell: bash
+
+        env:
+          SERVER_URL: ${{ inputs.server_url }}
+          AUTH_TOKEN: ${{ inputs.auth_token }}
+          WORKER_ID: ${{ inputs.worker_id }}
+          JOB_ID: ${{ inputs.job_id }}
+
+        run: |
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "UPLOAD ENDPOINT DEBUG"
+          echo "=========================================="
+
+          echo
+          echo "SERVER_URL=[$SERVER_URL]"
+          echo "WORKER_ID=[$WORKER_ID]"
+          echo "JOB_ID=[$JOB_ID]"
+          echo
+
+          # --------------------------------------------------
+          # 1. Authentication test
+          # --------------------------------------------------
+
+          echo "=== 1. ROOT WITHOUT TOKEN ==="
+
+          RESPONSE="$(
+            curl -sS \
+              --max-time 15 \
+              -w $'\n%{http_code}' \
+              "$SERVER_URL/" \
+              || true
+          )"
+
+          HTTP_CODE="${RESPONSE##*$'\n'}"
+          BODY="${RESPONSE%$'\n'*}"
+
+          echo "HTTP CODE: $HTTP_CODE"
+          echo "BODY: $BODY"
+
+          if [[ "$HTTP_CODE" != "403" ]]; then
+            echo "❌ Expected 403 without token"
+            exit 1
+          fi
+
+          echo "✅ Authentication rejection works"
+
+          # --------------------------------------------------
+          # 2. Authenticated request
+          # --------------------------------------------------
+
+          echo
+          echo "=== 2. ROOT WITH TOKEN ==="
+
+          RESPONSE="$(
+            curl -sS \
+              --max-time 15 \
+              -w $'\n%{http_code}' \
+              "${SERVER_URL}/?token=${AUTH_TOKEN}" \
+              || true
+          )"
+
+          HTTP_CODE="${RESPONSE##*$'\n'}"
+          BODY="${RESPONSE%$'\n'*}"
+
+          echo "HTTP CODE: $HTTP_CODE"
+          echo "BODY: $BODY"
+
+          if [[ "$HTTP_CODE" != "404" ]]; then
+            echo "❌ Expected 404 for authenticated /"
+            exit 1
+          fi
+
+          echo "✅ Token authentication works"
+
+          # --------------------------------------------------
+          # 3. Health endpoint
+          # --------------------------------------------------
+
+          echo
+          echo "=== 3. HEALTH WITH TOKEN ==="
+
+          RESPONSE="$(
+            curl -sS \
+              --max-time 15 \
+              -w $'\n%{http_code}' \
+              "${SERVER_URL}/health?token=${AUTH_TOKEN}" \
+              || true
+          )"
+
+          HTTP_CODE="${RESPONSE##*$'\n'}"
+          BODY="${RESPONSE%$'\n'*}"
+
+          echo "HTTP CODE: $HTTP_CODE"
+          echo "BODY: $BODY"
+
+          if [[ "$HTTP_CODE" != "200" ]]; then
+            echo "❌ Health endpoint failed"
+            exit 1
+          fi
+
+          if [[ "$BODY" != "OK" ]]; then
+            echo "❌ Unexpected health response"
+            exit 1
+          fi
+
+          echo "✅ Health endpoint works"
+
+          # --------------------------------------------------
+          # 4. OPTIONS
+          # --------------------------------------------------
+
+          echo
+          echo "=== 4. ENQUEUE OPTIONS ==="
+
+          RESPONSE="$(
+            curl -sS \
+              --max-time 15 \
+              -i \
+              -X OPTIONS \
+              "${SERVER_URL}/upload/enqueue?token=${AUTH_TOKEN}" \
+              || true
+          )"
+
+          echo "$RESPONSE"
+
+          if ! printf '%s\n' "$RESPONSE" | grep -q \
+              '^HTTP/1.0 204 No Content\|^HTTP/1.1 204 No Content'; then
+
+            echo "❌ OPTIONS endpoint failed"
+            exit 1
+          fi
+
+          echo "✅ OPTIONS works"
+
+          # --------------------------------------------------
+          # 5. No real enqueue here
+          # --------------------------------------------------
+
+          echo
+          echo "=== 5. ENQUEUE TEST ==="
+
+          echo "⚠️ Skipping real enqueue."
+          echo "No fake upload job will be inserted into the queue."
+
+          # --------------------------------------------------
+
+          echo
+          echo "=========================================="
+          echo "ALL NON-DESTRUCTIVE DEBUG TESTS PASSED"
+          echo "=========================================="
+
+      # ======================================================
+      # Run action_tag.sh
+      # ======================================================
+
+      - name: Run action_tag.sh
+        shell: bash
+
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          WORKER_ID: ${{ inputs.worker_id }}
+
+          TDL_STORAGE: "type=bolt,path=/tmp/tdl-data/data"
+
+          STORAGE_FORUM_CHAT: "-1003574423862"
+
+          SERVER_URL: ${{ inputs.server_url }}
+          AUTH_TOKEN: ${{ inputs.auth_token }}
+
+          HASHTAG: ${{ inputs.hashtag }}
+
+        run: |
+          set -euo pipefail
+
+          WORKER_NUM=$((10#$WORKER_ID))
+
+          export TDL_NS="session_job_${WORKER_NUM}"
+
+          echo "=========================================="
+          echo "Worker : $WORKER_ID"
+          echo "Job    : $JOB_ID"
+          echo "TDL NS : $TDL_NS"
+          echo "=========================================="
+
+
+          chmod +x ./action_tag.sh
+
+
+          IFS=',' read -ra IDS <<< "${{ inputs.target_ids }}"
+
+          ID_ARGS=()
+
+
+          for id in "${IDS[@]}"; do
+
+            id="$(echo "$id" | xargs)"
+
+            [[ -n "$id" ]] || continue
+
+            ID_ARGS+=(
+              --id
+              "$id"
+            )
+
+          done
+
+
+          HASHTAG_ARGS=()
+
+
+          if [[ -n "$HASHTAG" ]]; then
+
+            HASHTAG_ARGS=(
+              --hashtag
+              "$HASHTAG"
+            )
+
+          fi
+
+
+          ./action_tag.sh \
+            "${ID_ARGS[@]}" \
+            "${HASHTAG_ARGS[@]}" \
+            ./videos/
+
+
+      # ======================================================
+      # Notify completion
+      # ======================================================
+
+      - name: Notify completion
+        if: always()
+        shell: bash
+
+        env:
+          SERVER_URL: ${{ inputs.server_url }}
+          AUTH_TOKEN: ${{ inputs.auth_token }}
+
+          JOB_ID: ${{ inputs.job_id }}
+          WORKER_ID: ${{ inputs.worker_id }}
+
+        run: |
+
+          STATUS="success"
+
+          if [[ "${{ job.status }}" != "success" ]]; then
+            STATUS="failed"
+          fi
+
+          echo "📤 Completion notification"
+          echo "   Job    : $JOB_ID"
+          echo "   Worker : $WORKER_ID"
+          echo "   Status : $STATUS"
+
+
+          curl \
+            -sS \
+            -m 15 \
+            -X POST \
+            "$SERVER_URL/complete?token=$AUTH_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"job_id\": \"$JOB_ID\",
+              \"worker_id\": \"$WORKER_ID\",
+              \"status\": \"$STATUS\"
+            }" \
+            >/dev/null 2>&1 || true
